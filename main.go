@@ -26,6 +26,7 @@ const (
 	sshPortArg     = "1080"
 	sshHost        = "sshj"
 	internalSuffix = ".internal"
+	testInternalHost = "git.svc.internal:443" // host to test if we're on home network
 )
 
 type ProxyServer struct {
@@ -41,43 +42,33 @@ func NewProxyServer() *ProxyServer {
 	}
 }
 
-// Check if connected to home WiFi
+// Check if connected to home WiFi by testing direct connectivity to internal host
 func (p *ProxyServer) isOnHomeNetwork() bool {
-	// Use networksetup to get current WiFi network
-	cmd := exec.Command("/usr/sbin/networksetup", "-getairportnetwork", "en0")
-	output, err := cmd.Output()
+	// Try to connect directly to an internal host
+	// If it works, we're on the home network
+	conn, err := net.DialTimeout("tcp", testInternalHost, 1*time.Second)
 	if err != nil {
-		// Try en1 if en0 fails
-		cmd = exec.Command("/usr/sbin/networksetup", "-getairportnetwork", "en1")
-		output, err = cmd.Output()
-		if err != nil {
-			log.Printf("Failed to check WiFi: %v", err)
-			return false
-		}
+		log.Printf("Not on home network (direct connection failed: %v)", err)
+		return false
 	}
-
-	// Output format: "Current Wi-Fi Network: SSID_NAME"
-	line := strings.TrimSpace(string(output))
-	if strings.Contains(line, ":") {
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) == 2 {
-			ssid := strings.TrimSpace(parts[1])
-			log.Printf("Current WiFi: %s", ssid)
-			return ssid == homeWifiSSID
-		}
-	}
-	return false
+	conn.Close()
+	log.Printf("On home network (direct connection to %s succeeded)", testInternalHost)
+	return true
 }
 
 // Check if domain should use SSH tunnel
 func (p *ProxyServer) shouldUseTunnel(host string) bool {
-	// Always direct if on home network
+	// Check if it's an .internal domain first
+	if !strings.HasSuffix(strings.ToLower(host), internalSuffix) {
+		return false
+	}
+
+	// Only for .internal domains, check if on home network
 	if p.isOnHomeNetwork() {
 		return false
 	}
 
-	// Check if it's an .internal domain
-	return strings.HasSuffix(strings.ToLower(host), internalSuffix)
+	return true
 }
 
 // Ensure SSH tunnel is running
@@ -88,7 +79,19 @@ func (p *ProxyServer) ensureTunnel() error {
 	if p.tunnelActive && p.sshCmd != nil && p.sshCmd.Process != nil {
 		// Check if process is still running
 		if err := p.sshCmd.Process.Signal(os.Signal(nil)); err == nil {
-			return nil // Tunnel is active
+			// Test if SOCKS is actually responding
+			testConn, err := net.DialTimeout("tcp", "localhost:"+socksPort, 500*time.Millisecond)
+			if err == nil {
+				testConn.Close()
+				return nil // Tunnel is active and responsive
+			}
+			// SOCKS not responding, kill the tunnel
+			log.Println("SSH tunnel unresponsive, killing...")
+			p.sshCmd.Process.Kill()
+			p.tunnelActive = false
+			time.Sleep(500 * time.Millisecond) // Wait for port to free up
+		} else {
+			p.tunnelActive = false
 		}
 	}
 
@@ -99,7 +102,12 @@ func (p *ProxyServer) ensureTunnel() error {
 		return fmt.Errorf("failed to get home directory: %v", err)
 	}
 	sshConfigPath := homeDir + "/.ssh/config"
-	p.sshCmd = exec.Command(sshCommand, "-F", sshConfigPath, sshArgs, sshPortArg, sshHost, "-N", "-o", "ServerAliveInterval=60", "-o", "ExitOnForwardFailure=yes")
+	p.sshCmd = exec.Command(sshCommand, "-F", sshConfigPath, sshArgs, sshPortArg, sshHost, "-N",
+		"-o", "ServerAliveInterval=10",
+		"-o", "ServerAliveCountMax=2",
+		"-o", "ConnectTimeout=10",
+		"-o", "TCPKeepAlive=yes",
+		"-o", "ExitOnForwardFailure=yes")
 
 	stderr, err := p.sshCmd.StderrPipe()
 	if err != nil {
